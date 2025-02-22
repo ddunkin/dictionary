@@ -2,6 +2,7 @@ import csv
 import json
 import os
 import sqlite3
+import sys
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -114,8 +115,8 @@ def insert_lemma_entries(conn, lemma, input_pos, word_forms, entries):
     
     conn.commit()
 
-# Function to fetch data from OpenAI API
-def get_lemma_data(lemma, input_pos):
+# New helper: Build prompt for a lemma
+def build_prompt(lemma, input_pos):
     prompt = f'''Provide the word forms, definitions, synonyms, and antonyms for the lemma "{lemma}" with its primary part of speech code "{input_pos}". Use these one-letter codes for parts of speech:
 a: article
 c: conjunction
@@ -132,6 +133,9 @@ u: interjection
 v: verb
 x: not
 
+For definition, use sentence fragments, not full sentences.
+Synonyms and antonyms should be single words or short phrases.
+
 Format the response as a JSON object with the following schema:
 {{
   "lemma": "string",
@@ -147,48 +151,131 @@ Format the response as a JSON object with the following schema:
   ]
 }}
 Include all inflected forms of the lemma in "word_forms" (e.g., for "run": "run", "runs", "running", "ran"). Ensure parts of speech are ordered by common usage, prioritizing "{input_pos}" if applicable, and within each part of speech, definitions, synonyms, and antonyms are ordered by common usage.'''
-    response = client.chat.completions.create(model="gpt-4o-mini",
-    messages=[
-        {"role": "system", "content": "You are a helpful assistant that provides word forms, definitions, synonyms, and antonyms in JSON format."},
-        {"role": "user", "content": prompt}
-    ],
-    temperature=0,
-    response_format={"type": "json_object"})
-    return json.loads(response.choices[0].message.content)
+    return prompt
 
-# Main execution
-def main():
-    # Connect to SQLite database
-    conn = sqlite3.connect('dictionary.db')
-    create_tables(conn)
-    
+# New function: submit batch job
+def submit_batch():
     # Read the TSV input file
     try:
         with open('lemmas.tsv', 'r', newline='') as file:
             reader = csv.reader(file, delimiter='\t')
-            next(reader)  # Skip header row
+            next(reader)  # Skip header
             lemma_pos_pairs = [(row[0].strip().lower(), row[1].strip().lower()) for row in reader if len(row) >= 2]
     except FileNotFoundError:
-        print("Error: 'lemmas.tsv' not found. Please create this file with 'lemma<TAB>part_of_speech' per line and a header.")
-        conn.close()
-        return
+        print("Error: 'lemmas.tsv' not found.")
+        sys.exit(1)
     
-    print(f"Processing {len(lemma_pos_pairs)} lemmas...")
+    tasks = []
+    for idx, (lemma, input_pos) in enumerate(lemma_pos_pairs):
+        prompt = build_prompt(lemma, input_pos)
+        task = {
+            "custom_id": f"task-{idx}",
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": {
+                "model": "gpt-4o-mini",
+                "temperature": 0,
+                "response_format": { "type": "json_object" },
+                "messages": [
+                    { "role": "system", "content": "You are a helpful assistant that provides word forms, definitions, synonyms, and antonyms in JSON format." },
+                    { "role": "user", "content": prompt }
+                ]
+            }
+        }
+        tasks.append(task)
     
-    # Process each lemma and its part of speech
-    for lemma, input_pos in lemma_pos_pairs:
-        try:
-            data = get_lemma_data(lemma, input_pos)
-            if data['lemma'].lower() != lemma:
-                print(f"Warning: Response lemma '{data['lemma']}' does not match input '{lemma}'")
-                continue
-            insert_lemma_entries(conn, lemma, input_pos, data['word_forms'], data['entries'])
-            print(f"Processed: {lemma} ({input_pos})")
-        except Exception as e:
-            print(f"Error processing '{lemma} ({input_pos})': {e}")
+    # Write batch tasks file
+    tasks_file = "batch_tasks_lemmas.jsonl"
+    with open(tasks_file, 'w') as file:
+        for task in tasks:
+            file.write(json.dumps(task) + "\n")
+    print(f"Batch tasks file created: {tasks_file}")
     
+    # Upload file and create batch job
+    batch_file = client.files.create(
+        file=open(tasks_file, "rb"),
+        purpose="batch"
+    )
+    batch_job = client.batches.create(
+        input_file_id=batch_file.id,
+        endpoint="/v1/chat/completions",
+        completion_window="24h"
+    )
+    # Save job ID for processing later
+    with open("batch_job_id.txt", "w") as f:
+        f.write(batch_job.id)
+    print(f"Batch job submitted. Job ID: {batch_job.id}")
+
+# New function: process batch job results and update the database
+def process_batch():
+    # Read job ID from file
+    try:
+        with open("batch_job_id.txt", "r") as f:
+            job_id = f.read().strip()
+    except FileNotFoundError:
+        print("No batch job ID found. Please run 'submit' command first.")
+        sys.exit(1)
+    
+    # Retrieve batch job
+    batch_job = client.batches.retrieve(job_id)
+    if batch_job.status != "completed":
+        print(f"Batch job not complete yet. Current status: {batch_job.status}")
+        sys.exit(0)
+    
+    # Download results
+    result_file_id = batch_job.output_file_id
+    result_content = client.files.content(result_file_id).content
+    results_file = "batch_job_results_lemmas.jsonl"
+    with open(results_file, "wb") as file:
+        file.write(result_content)
+    print(f"Results saved to: {results_file}")
+    
+    # Re-read lemmas.tsv to match tasks with input
+    try:
+        with open('lemmas.tsv', 'r', newline='') as file:
+            reader = csv.reader(file, delimiter='\t')
+            next(reader)
+            lemma_pos_pairs = [(row[0].strip().lower(), row[1].strip().lower()) for row in reader if len(row) >= 2]
+    except FileNotFoundError:
+        print("Error: 'lemmas.tsv' not found.")
+        sys.exit(1)
+    
+    # Connect to SQLite database
+    conn = sqlite3.connect('dictionary.db')
+    create_tables(conn)
+    
+    # Process each result (custom_id is task-{idx} so idx maps to lemma_pos_pairs)
+    with open(results_file, "r") as file:
+        for line in file:
+            try:
+                obj = json.loads(line.strip())
+                task_id = obj.get("custom_id", "")
+                idx = int(task_id.split("-")[-1])
+                # Get the API response contained in response.body.choices[0].message.content
+                api_resp = obj["response"]["body"]["choices"][0]["message"]["content"]
+                data = json.loads(api_resp)
+                
+                lemma, input_pos = lemma_pos_pairs[idx]
+                if data.get("lemma", "").lower() != lemma:
+                    print(f"Warning: Response lemma '{data.get('lemma')}' does not match input '{lemma}'")
+                    continue
+                insert_lemma_entries(conn, lemma, input_pos, data.get("word_forms", []), data.get("entries", []))
+                print(f"Processed: {lemma} ({input_pos})")
+            except Exception as e:
+                print(f"Error processing result for task {task_id}: {e}")
     conn.close()
     print("Dictionary and thesaurus build complete.")
+
+# Main execution: check command-line argument to choose mode.
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in ("submit", "process"):
+        print("Usage: python build.py [submit|process]")
+        sys.exit(1)
+    command = sys.argv[1]
+    if command == "submit":
+        submit_batch()
+    elif command == "process":
+        process_batch()
 
 if __name__ == "__main__":
     main()
